@@ -21,11 +21,21 @@ import (
 )
 
 func DisplaySolveStatus(ctx context.Context, phase string, c console.Console, w io.Writer, ch chan *client.SolveStatus) error {
+	return DisplaySolveStatusPrinter(ctx, phase, c, w, ch, nil, nil)
+}
+
+func DisplaySolveStatusPrinter(ctx context.Context, phase string, c console.Console, w io.Writer, ch chan *client.SolveStatus, printCb VertexPrintFunc, logPrintCb LogPrintFunc) error {
 
 	modeConsole := c != nil
 
 	disp := &display{c: c, phase: phase}
-	printer := &textMux{w: w}
+	printer := newTextMux(w)
+	if printCb != nil {
+		printer.printCb = printCb
+	}
+	if logPrintCb != nil {
+		printer.logPrintCb = logPrintCb
+	}
 
 	if disp.phase == "" {
 		disp.phase = "Building"
@@ -120,6 +130,12 @@ type trace struct {
 	modeConsole   bool
 }
 
+type log struct {
+	index  int
+	line   []byte
+	stream int
+}
+
 type vertex struct {
 	*client.Vertex
 	statuses []*status
@@ -127,7 +143,7 @@ type vertex struct {
 	indent   string
 	index    int
 
-	logs          [][]byte
+	logs          []log
 	logsPartial   bool
 	logsOffset    int
 	prev          *client.Vertex
@@ -266,8 +282,8 @@ func (t *trace) update(s *client.SolveStatus, termWidth int) {
 		}
 		i := 0
 		complete := split(l.Data, byte('\n'), func(dt []byte) {
-			if v.logsPartial && len(v.logs) != 0 && i == 0 {
-				v.logs[len(v.logs)-1] = append(v.logs[len(v.logs)-1], dt...)
+			if v.logsPartial && len(v.logs) != 0 && i == 0 && v.logs[len(v.logs)-1].stream == l.Stream {
+				v.logs[len(v.logs)-1].line = append(v.logs[len(v.logs)-1].line, dt...)
 			} else {
 				ts := time.Duration(0)
 				if v.Started != nil {
@@ -280,7 +296,11 @@ func (t *trace) update(s *client.SolveStatus, termWidth int) {
 				} else if sec < 100 {
 					prec = 2
 				}
-				v.logs = append(v.logs, []byte(fmt.Sprintf("#%d %s %s", v.index, fmt.Sprintf("%.[2]*[1]f", sec, prec), dt)))
+				v.logs = append(v.logs, log{
+					line:   []byte(fmt.Sprintf("#%d %s %s", v.index, fmt.Sprintf("%.[2]*[1]f", sec, prec), dt)),
+					stream: l.Stream,
+					index:  v.index,
+				})
 			}
 			i++
 		})
@@ -296,7 +316,7 @@ func (t *trace) printErrorLogs(f io.Writer) {
 			fmt.Fprintln(f, "------")
 			fmt.Fprintf(f, " > %s:\n", v.Name)
 			for _, l := range v.logs {
-				f.Write(l)
+				f.Write(l.line)
 				fmt.Fprintln(f)
 			}
 			fmt.Fprintln(f, "------")

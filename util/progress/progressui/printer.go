@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/moby/buildkit/client"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/tonistiigi/units"
 )
@@ -18,16 +19,37 @@ const maxDelay = 10 * time.Second
 const minTimeDelta = 5 * time.Second
 const minProgressDelta = 0.05 // %
 
+type VertexPrintFunc func(v *client.Vertex, format string, a ...interface{})
+type LogPrintFunc func(v *client.Vertex, stream int, partial bool, format string, a ...interface{})
+
 type lastStatus struct {
 	Current   int64
 	Timestamp time.Time
 }
 
 type textMux struct {
-	w        io.Writer
+	w          io.Writer
+	printCb    VertexPrintFunc
+	logPrintCb LogPrintFunc
+
 	current  digest.Digest
 	last     map[string]lastStatus
 	notFirst bool
+}
+
+func newTextMux(w io.Writer) *textMux {
+	return &textMux{
+		printCb: func(v *client.Vertex, format string, a ...interface{}) {
+			fmt.Fprintf(w, fmt.Sprintf("%s\n", format), a...)
+		},
+		logPrintCb: func(v *client.Vertex, stream int, partial bool, format string, a ...interface{}) {
+			if partial {
+				fmt.Fprintf(w, format, a...)
+			} else {
+				fmt.Fprintf(w, fmt.Sprintf("%s\n", format), a...)
+			}
+		},
+	}
 }
 
 func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
@@ -44,24 +66,24 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 		if p.current != "" {
 			old := t.byDigest[p.current]
 			if old.logsPartial {
-				fmt.Fprintln(p.w, "")
+				p.printCb(v.Vertex, "")
 			}
 			old.logsOffset = 0
 			old.count = 0
-			fmt.Fprintf(p.w, "#%d ...\n", old.index)
+			p.printCb(v.Vertex, "#%d ...", old.index)
 		}
 
 		if p.notFirst {
-			fmt.Fprintln(p.w, "")
+			p.printCb(v.Vertex, "")
 		} else {
 			p.notFirst = true
 		}
 
 		if os.Getenv("PROGRESS_NO_TRUNC") == "0" {
-			fmt.Fprintf(p.w, "#%d %s\n", v.index, limitString(v.Name, 72))
+			p.printCb(v.Vertex, "#%d %s", v.index, limitString(v.Name, 72))
 		} else {
-			fmt.Fprintf(p.w, "#%d %s\n", v.index, v.Name)
-			fmt.Fprintf(p.w, "#%d %s\n", v.index, v.Digest)
+			p.printCb(v.Vertex, "#%d %s", v.index, v.Name)
+			p.printCb(v.Vertex, "#%d %s", v.index, v.Digest)
 		}
 
 	}
@@ -70,7 +92,7 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 		v.logsOffset = 0
 	}
 	for _, ev := range v.events {
-		fmt.Fprintf(p.w, "#%d %s\n", v.index, ev)
+		p.printCb(v.Vertex, "#%d %s", v.index, ev)
 	}
 	v.events = v.events[:0]
 
@@ -118,25 +140,24 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 			if s.Completed != nil {
 				tm += " done"
 			}
-			fmt.Fprintf(p.w, "#%d %s%s%s\n", v.index, s.ID, bytes, tm)
+			p.printCb(v.Vertex, "#%d %s%s%s", v.index, s.ID, bytes, tm)
 		}
 	}
 	v.statusUpdates = map[string]struct{}{}
 
 	for i, l := range v.logs {
+		line := l.line
 		if i == 0 {
-			l = l[v.logsOffset:]
+			line = line[v.logsOffset:]
 		}
-		fmt.Fprintf(p.w, "%s", []byte(l))
-		if i != len(v.logs)-1 || !v.logsPartial {
-			fmt.Fprintln(p.w, "")
-		}
+		complete := i != len(v.logs)-1 || !v.logsPartial
+		p.logPrintCb(v.Vertex, l.stream, !complete, "%s", []byte(line))
 	}
 
 	if len(v.logs) > 0 {
 		if v.logsPartial {
 			v.logs = v.logs[len(v.logs)-1:]
-			v.logsOffset = len(v.logs[0])
+			v.logsOffset = len(v.logs[0].line)
 		} else {
 			v.logs = nil
 			v.logsOffset = 0
@@ -150,21 +171,21 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 
 		if v.Error != "" {
 			if v.logsPartial {
-				fmt.Fprintln(p.w, "")
+				p.printCb(v.Vertex, "")
 			}
 			if strings.HasSuffix(v.Error, context.Canceled.Error()) {
-				fmt.Fprintf(p.w, "#%d CANCELED\n", v.index)
+				p.printCb(v.Vertex, "#%d CANCELED", v.index)
 			} else {
-				fmt.Fprintf(p.w, "#%d ERROR: %s\n", v.index, v.Error)
+				p.printCb(v.Vertex, "#%d ERROR: %s", v.index, v.Error)
 			}
 		} else if v.Cached {
-			fmt.Fprintf(p.w, "#%d CACHED\n", v.index)
+			p.printCb(v.Vertex, "#%d CACHED", v.index)
 		} else {
 			tm := ""
 			if v.Started != nil {
 				tm = fmt.Sprintf(" %.1fs", v.Completed.Sub(*v.Started).Seconds())
 			}
-			fmt.Fprintf(p.w, "#%d DONE%s\n", v.index, tm)
+			p.printCb(v.Vertex, "#%d DONE%s", v.index, tm)
 		}
 
 	}
